@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "community-kv"
+version = "0.1.0"
+description = "CommunityKV: fused attention with top-kappa key extraction"
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.9.0",
+    "triton==3.5.0",
+    "datasets==4.8.5",
+    "python-igraph>=0.11.0",
+    "transformers==5.7.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["community_kv*"]
+
+[tool.pytest.ini_options]
+testpaths = ["community_kv/tests"]
