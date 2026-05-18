@@ -17,9 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
+# Installing cugraph/cudf requires the NVIDIA pip index, e.g.:
+#   pip install -e '.[cugraph]' --extra-index-url=https://pypi.nvidia.com
+cugraph = ["cugraph-cu12", "cudf-cu12"]
 
 [tool.setuptools.packages.find]
 include = ["community_kv*"]
 
 [tool.pytest.ini_options]
-testpaths = ["community_kv/tests"]
+testpaths = ["tests"]

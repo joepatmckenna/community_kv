@@ -3,7 +3,7 @@
 Registers a custom attention implementation that can be activated via:
 
     from community_kv.community_kv_attention import register_community_kv_attention, ATTN_NAME
-    register_community_kv_attention(kappa=8, sink_size=4)
+    register_community_kv_attention(kappa=8, num_sink_tok_to_exclude=4)
     model.config._attn_implementation = ATTN_NAME
 """
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from community_kv.kernels.attention_topk import attention_with_topk
+from community_kv.kernels.attention_with_topk import attention_with_topk
 from community_kv.graph import GraphManager
 
 ATTN_NAME = "community_kv"
@@ -20,7 +20,7 @@ ATTN_NAME = "community_kv"
 # Global config for the attention function (set via register_community_kv_attention)
 _CONFIG = {
     "kappa": 8,
-    "sink_size": 4,
+    "num_sink_tok_to_exclude": 4,
     "graph_manager": None,  # type: GraphManager | None
     "previous_attn_fn": None,  # type: Callable | None
 }
@@ -41,7 +41,7 @@ def community_kv_attention_forward(
     Uses our kernel for prefill (q_len > 1) and the previous attn impl for decode.
     """
     kappa = _CONFIG["kappa"]
-    sink_size = _CONFIG["sink_size"]
+    num_sink_tok_to_exclude = _CONFIG["num_sink_tok_to_exclude"]
 
     B, H, S_q, D = query.shape
     S_k = key.shape[2]
@@ -49,13 +49,13 @@ def community_kv_attention_forward(
     manager: GraphManager = _CONFIG["graph_manager"]
 
     # Use our kernel for prefill, previous impl for decode
-    if S_q > 1 and S_k >= kappa + sink_size:
+    if S_q > 1 and S_k >= kappa + num_sink_tok_to_exclude:
         attn_output, topk_indices, topk_scores = attention_with_topk(
             query.contiguous(),
             key.contiguous(),
             value.contiguous(),
             kappa=kappa,
-            sink_size=sink_size,
+            num_sink_tok_to_exclude=num_sink_tok_to_exclude,
         )
 
         # Store graph data and launch async graph construction
@@ -66,8 +66,7 @@ def community_kv_attention_forward(
             keys=key[0],       # (H_kv, S, D)
         )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output, None
+        return attn_output.transpose(1, 2).contiguous(), None
     else:
         # Decode: retrieve indices and gather KV
         retrieved_indices = manager.retrieve(
@@ -118,7 +117,7 @@ def community_kv_attention_forward(
 
 def register_community_kv_attention(
     kappa: int = 8,
-    sink_size: int = 4,
+    num_sink_tok_to_exclude: int = 4,
     graph_manager: GraphManager | None = None,
     previous_attn_impl: str = "eager",
 ):
@@ -129,13 +128,13 @@ def register_community_kv_attention(
 
     Args:
         kappa: top-k keys per query
-        sink_size: number of sink tokens excluded from top-k
+        num_sink_tok_to_exclude: number of sink tokens excluded from top-k
         graph_manager: GraphManager for async graph construction.
         previous_attn_impl: the attention implementation to delegate to during
             decode (e.g. "sdpa", "flash_attention_2", "eager").
     """
     _CONFIG["kappa"] = kappa
-    _CONFIG["sink_size"] = sink_size
+    _CONFIG["num_sink_tok_to_exclude"] = num_sink_tok_to_exclude
     _CONFIG["graph_manager"] = graph_manager
 
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS

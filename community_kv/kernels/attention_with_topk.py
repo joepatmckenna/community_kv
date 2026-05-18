@@ -4,7 +4,7 @@ This kernel mirrors the structure of the PyTorch reference in `reference.py`:
 - Online softmax for attention output
 - Per-K-tile sort to produce tile-local top-kappa
 - Merge tile-local top-kappa with running top-kappa via sort over 2*kappa
-- Skip queries with position < kappa - 1 + sink_size (no valid top-kappa)
+- Skip queries with position < kappa - 1 + num_sink_tok_to_exclude (no valid top-kappa)
 - Apply positional scaling at end
 - Convert raw-equivalent scores to softmax weights at end via final m, l
 
@@ -50,7 +50,7 @@ def _unpack_score_index(packed):
 
 
 @triton.jit
-def _attention_topk_fwd_kernel(
+def _attention_with_topk_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
     Out_ptr,
     TopkIdx_ptr, TopkScore_ptr,
@@ -61,9 +61,9 @@ def _attention_topk_fwd_kernel(
     stride_tib, stride_tih, stride_tis, stride_tik,
     stride_tsb, stride_tsh, stride_tss, stride_tsk,
     B, H, H_kv, S, D,
-    init_q_start,        # = kappa - 1 + sink_size
-    sink_size,
-    softmax_scale,
+    init_q_start,        # = kappa - 1 + num_sink_tok_to_exclude
+    num_sink_tok_to_exclude,
+    scale,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
     KAPPA: tl.constexpr,
@@ -116,7 +116,7 @@ def _attention_topk_fwd_kernel(
         k_tile = tl.load(k_ptrs, mask=k_in_seq_mask[:, None], other=0.0)
         v_tile = tl.load(v_ptrs, mask=k_in_seq_mask[:, None], other=0.0)
 
-        s = tl.dot(q, tl.trans(k_tile)) * softmax_scale
+        s = tl.dot(q, tl.trans(k_tile)) * scale
 
         # Mask invalid score positions (causal, padded keys, padded queries)
         causal_mask = q_offsets[:, None] < k_offsets[None, :]
@@ -135,7 +135,7 @@ def _attention_topk_fwd_kernel(
         l_i = l_i * alpha + tl.sum(p_attn, axis=1)
 
         # ---- Top-kappa pool: same scores but with sinks masked out ----
-        is_sink = k_offsets < sink_size
+        is_sink = k_offsets < num_sink_tok_to_exclude
         s_for_topk = tl.where(is_sink[None, :], -float("inf"), s)
         p_topk = tl.exp(s_for_topk - m_new[:, None])
         # NaN check: if both s and m_new are -inf, exp gives nan. Replace with 0.
@@ -202,17 +202,17 @@ def attention_with_topk(
     k: torch.Tensor,
     v: torch.Tensor,
     kappa: int,
-    sink_size: int = 0,
-    softmax_scale: float | None = None,
-    block_q: int = 64,
+    scale: float | None = None,
+    num_sink_tok_to_exclude: int = 0,
+    block_q: int = 128,
     block_k: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Causal attention + fused top-kappa extraction.
 
     - Output covers ALL query positions [0, S).
     - Top-kappa indices/scores cover query positions [init_q_start, S) where
-      init_q_start = kappa - 1 + sink_size.
-    - Top-kappa pool excludes positions [0, sink_size).
+      init_q_start = kappa - 1 + num_sink_tok_to_exclude.
+    - Top-kappa pool excludes positions [0, num_sink_tok_to_exclude).
     - Top-kappa scores are post-softmax weights.
 
     Args:
@@ -220,8 +220,8 @@ def attention_with_topk(
         k: (B, H_kv, S, D)
         v: (B, H_kv, S, D)
         kappa: number of top keys per query, must be a power of 2
-        sink_size: leading positions excluded from top-kappa
-        softmax_scale: defaults to 1/sqrt(D)
+        scale: softmax scale; defaults to 1/sqrt(D)
+        num_sink_tok_to_exclude: leading positions excluded from top-kappa
         block_q: query tile size, must be a power of 2
         block_k: key tile size, must be a power of 2 and >= kappa
 
@@ -242,13 +242,13 @@ def attention_with_topk(
     assert block_k >= kappa
     assert (D & (D - 1)) == 0
 
-    init_q_start = kappa - 1 + sink_size
-    assert init_q_start < S, f"sequence too short for kappa={kappa}, sink={sink_size}"
+    init_q_start = kappa - 1 + num_sink_tok_to_exclude
+    assert init_q_start < S, f"sequence too short for kappa={kappa}, sink={num_sink_tok_to_exclude}"
 
     out_topk_len = S - init_q_start
 
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(D)
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
 
     out = torch.empty_like(q)
     topk_indices = torch.empty((B, H, out_topk_len, kappa), dtype=torch.int32, device=q.device)
@@ -256,7 +256,7 @@ def attention_with_topk(
 
     grid = (triton.cdiv(S, block_q), B * H)
 
-    _attention_topk_fwd_kernel[grid](
+    _attention_with_topk_fwd_kernel[grid](
         q, k, v,
         out,
         topk_indices, topk_scores,
@@ -268,8 +268,8 @@ def attention_with_topk(
         topk_scores.stride(0), topk_scores.stride(1), topk_scores.stride(2), topk_scores.stride(3),
         B, H, H_kv, S, D,
         init_q_start,
-        sink_size,
-        softmax_scale,
+        num_sink_tok_to_exclude,
+        scale,
         BLOCK_Q=block_q,
         BLOCK_K=block_k,
         KAPPA=kappa,
