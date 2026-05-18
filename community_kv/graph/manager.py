@@ -43,7 +43,7 @@ class GraphManager:
         aggregation: GraphAggregation = GraphAggregation.QUERY_GROUP,
         num_sink_tok_to_exclude: int = 10,
         lam: float = 0.5,
-        leiden_backend: str = "igraph",
+        leiden_backend: str = "cugraph",
     ):
         assert leiden_backend in ("igraph", "cugraph"), (
             f"leiden_backend must be 'igraph' or 'cugraph', got {leiden_backend!r}"

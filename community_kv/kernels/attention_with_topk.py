@@ -256,24 +256,25 @@ def attention_with_topk(
 
     grid = (triton.cdiv(S, block_q), B * H)
 
-    _attention_with_topk_fwd_kernel[grid](
-        q, k, v,
-        out,
-        topk_indices, topk_scores,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        topk_indices.stride(0), topk_indices.stride(1), topk_indices.stride(2), topk_indices.stride(3),
-        topk_scores.stride(0), topk_scores.stride(1), topk_scores.stride(2), topk_scores.stride(3),
-        B, H, H_kv, S, D,
-        init_q_start,
-        num_sink_tok_to_exclude,
-        scale,
-        BLOCK_Q=block_q,
-        BLOCK_K=block_k,
-        KAPPA=kappa,
-        HEAD_DIM=D,
-    )
+    with torch.cuda.device(q.device):
+        _attention_with_topk_fwd_kernel[grid](
+            q, k, v,
+            out,
+            topk_indices, topk_scores,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            topk_indices.stride(0), topk_indices.stride(1), topk_indices.stride(2), topk_indices.stride(3),
+            topk_scores.stride(0), topk_scores.stride(1), topk_scores.stride(2), topk_scores.stride(3),
+            B, H, H_kv, S, D,
+            init_q_start,
+            num_sink_tok_to_exclude,
+            scale,
+            BLOCK_Q=block_q,
+            BLOCK_K=block_k,
+            KAPPA=kappa,
+            HEAD_DIM=D,
+        )
 
     return out, topk_indices, topk_scores
