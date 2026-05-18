@@ -33,15 +33,16 @@ class GraphManager:
 
     def __init__(
         self,
+        *,
+        num_query_heads: int,
+        num_kv_heads: int,
+        num_layers: int,
+        head_dim: int,
+        token_budget: int,
+        max_new_tokens: int,
         aggregation: GraphAggregation = GraphAggregation.QUERY_GROUP,
-        num_query_heads: int = 32,
-        num_kv_heads: int = 8,
-        num_layers: int = 36,
-        head_dim: int = 128,
-        num_sink_tok_to_exclude: int = 4,
+        num_sink_tok_to_exclude: int = 10,
         lam: float = 0.5,
-        token_budget: int = 1024,
-        max_new_tokens: int = 1024,
         leiden_backend: str = "igraph",
     ):
         assert leiden_backend in ("igraph", "cugraph"), (
@@ -80,6 +81,10 @@ class GraphManager:
         self._leiden_executor = ThreadPoolExecutor(max_workers=8)
         self._ready_events: dict[int, threading.Event] = {}
         self._init_errors: dict[int, Exception] = {}
+        # CUDA event recorded on the worker's stream after init writes finish.
+        # retrieve() waits on it so the main thread's reads are ordered after
+        # the worker's writes on the same device.
+        self._completion_events: dict[int, torch.cuda.Event] = {}
 
     def initialize(
         self,
@@ -100,7 +105,15 @@ class GraphManager:
         """
         event = threading.Event()
         self._ready_events[layer_idx] = event
-        self._executor.submit(self._do_initialize, layer_idx, topk_indices, topk_scores, keys, event)
+        # Record a CUDA event on the producer's current stream so the worker
+        # can wait for the producing kernels (attention_with_topk) to complete
+        # before reading topk_indices/topk_scores/keys on its own stream.
+        with torch.cuda.device(keys.device):
+            producer_event = torch.cuda.Event()
+            producer_event.record()
+        self._executor.submit(
+            self._do_initialize, layer_idx, topk_indices, topk_scores, keys, event, producer_event,
+        )
 
     def _do_initialize(
         self,
@@ -109,10 +122,19 @@ class GraphManager:
         topk_scores: torch.Tensor,
         keys: torch.Tensor,
         event: threading.Event,
+        producer_event: torch.cuda.Event,
     ):
         """Actual initialization logic. Runs in thread pool."""
         try:
-            self._initialize_impl(layer_idx, topk_indices, topk_scores, keys)
+            with torch.cuda.device(keys.device):
+                # Order this thread's stream after the producer's stream.
+                producer_event.wait()
+                self._initialize_impl(layer_idx, topk_indices, topk_scores, keys)
+                # Record an event so retrieve() can order the main thread's
+                # reads after the writes done here.
+                completion = torch.cuda.Event()
+                completion.record()
+                self._completion_events[layer_idx] = completion
         except Exception as e:
             self._init_errors[layer_idx] = e
         finally:
@@ -399,6 +421,13 @@ class GraphManager:
             # Re-raise any error from the init thread
             if layer_idx in self._init_errors:
                 raise self._init_errors[layer_idx]
+            # Order this thread's reads after the worker's writes on the same
+            # device. event.set() only gives CPU-level happens-before; without
+            # this CUDA wait the main thread can read uninitialized state.
+            completion = self._completion_events.get(layer_idx)
+            if completion is not None:
+                with torch.cuda.device(key.device):
+                    completion.wait()
 
         H_q = query.shape[0]
         H_kv = key.shape[0]
@@ -695,6 +724,7 @@ class GraphManager:
         self._initialized.clear()
         self._ready_events.clear()
         self._init_errors.clear()
+        self._completion_events.clear()
 
     def shutdown(self):
         self._executor.shutdown(wait=True)
