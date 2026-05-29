@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch>=2.4", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "community-kv"
+version = "0.1.0"
+description = "Community-graph based KV cache compression for long-context LLM inference"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.40",
+    "datasets>=2.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "black>=24", "ipython"]
+
+[project.scripts]
+community-kv-eval = "evals.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["community_kv*", "evals*"]
+
+[tool.setuptools.package-data]
+"community_kv.graph._leiden._csrc" = ["*.cu", "*.cuh", "*.cpp", "*.h", "*.hpp"]
+"community_kv.attention" = ["flash-attention.patch"]
+"evals" = ["resolutions.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --cov=community_kv --cov=evals --cov-report=term"
+
+[tool.coverage.run]
+omit = [
+    "community_kv/graph/_leiden/_csrc/*",
+    "*/__pycache__/*",
+    "tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    third_party
+  | build
+  | \.build
+  | community_kv/graph/_leiden/_csrc
+)/
+'''

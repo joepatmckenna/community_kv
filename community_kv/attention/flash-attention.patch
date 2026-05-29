@@ -1,0 +1,772 @@
+diff --git a/.gitignore b/.gitignore
+index 1f1f802..a962c0e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -29,3 +29,6 @@ var/
+ 
+ # Dev
+ venv
++
++# Built python package dir (created by hopper/setup.py during install)
++hopper/flash_attn_3/
+diff --git a/hopper/flash.h b/hopper/flash.h
+index bee89e5..cd6eafc 100644
+--- a/hopper/flash.h
++++ b/hopper/flash.h
+@@ -159,6 +159,24 @@ struct Flash_fwd_params : public Qkv_params {
+ 
+     int arch;
+     int num_sm;
++
++    // community_kv top-K (Half 2). When ptr_topk_val != nullptr, FA3-fwd writes
++    //   topk_val[B,H,Sq,K] (fp32, normalized softmax probs) and
++    //   topk_idx[B,H,Sq,K] (int32, absolute kv index in [0, seqlen_k)).
++    // K is dispatched at compile time via TOPK_SWITCH; runtime topk_K must be in
++    // {2, 4, 8, 16, 32}. Only active for the gated target template tuple (bf16 +
++    // headdim 128 + PackGQA + !FP8); ignored otherwise.
++    void*   topk_val_ptr = nullptr;
++    void*   topk_idx_ptr = nullptr;
++    index_t topk_batch_stride = 0;
++    index_t topk_head_stride  = 0;
++    index_t topk_row_stride   = 0;
++    int     topk_K            = 0;
++    // community_kv top-K sink/skip controls.
++    //   topk_kv_start: exclude kv columns [0, topk_kv_start) from candidates.
++    //   topk_q_skip:   skip the first topk_q_skip q-rows; output row = q_idx - topk_q_skip.
++    int     topk_kv_start     = 0;
++    int     topk_q_skip       = 0;
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
+index 33185bf..451b774 100644
+--- a/hopper/flash_api.cpp
++++ b/hopper/flash_api.cpp
+@@ -634,7 +634,7 @@ mha_fwd_get_scheduler_metadata(
+ // h: num_heads
+ // h_k: num_heads_k
+ // d: head_size
+-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
++std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+         at::Tensor k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
+         at::Tensor v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
+@@ -669,7 +669,19 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
+         int64_t num_splits,
+         std::optional<bool> pack_gqa_,
+-        int64_t sm_margin
++        int64_t sm_margin,
++        // community_kv top-K (Half 2): when return_topk=True, FA3 also returns
++        //   topk_val [B,H,Sq_out,K] (fp32 normalized softmax probs) and
++        //   topk_idx [B,H,Sq_out,K] (int32 absolute kv index in [exclude_sink_tokens, seqlen_k)).
++        // Currently only supported for: bf16 + head_dim=128 + PackGQA + !FP8 + non-paged.
++        // topk_K is dispatched at compile time via TOPK_SWITCH; valid values are {2, 4, 8, 16, 32}.
++        // exclude_sink_tokens excludes kv columns [0, s) from candidates and skips the
++        //   first q_skip q-rows whose causal-accessible non-sink range is < K. The output
++        //   q-dimension is Sq_out = max(0, seqlen_q - q_skip), where
++        //     q_skip = max(0, seqlen_q + s + topk_K - 1 - seqlen_k).
++        bool return_topk,
++        int64_t topk_K,
++        int64_t exclude_sink_tokens
+         ) {
+ 
+     auto dprops = at::cuda::getCurrentDeviceProperties();
+@@ -856,6 +868,41 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+         softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+     }
+ 
++    // community_kv top-K (Half 2): allocate output tensors when requested.
++    // Constraints map to the kernel's compile-time gate (kProbeEnabled in mainloop).
++    at::Tensor topk_val, topk_idx;
++    int topk_q_skip = 0;
++    int64_t topk_seqlen_q_out = 0;
++    if (return_topk) {
++        TORCH_CHECK(topk_K == 2 || topk_K == 4 || topk_K == 8 || topk_K == 16 || topk_K == 32,
++                    "return_topk currently requires topk_K in {2, 4, 8, 16, 32}");
++        TORCH_CHECK(q_type == at::ScalarType::BFloat16,
++                    "return_topk currently requires bfloat16 q/k/v");
++        TORCH_CHECK(head_size_v == 128,
++                    "return_topk currently requires head_size_v == 128");
++        TORCH_CHECK(!paged_KV,
++                    "return_topk currently does not support paged KV");
++        TORCH_CHECK(!is_varlen_q && !is_varlen_k,
++                    "return_topk currently does not support varlen");
++        TORCH_CHECK(exclude_sink_tokens >= 0,
++                    "exclude_sink_tokens must be non-negative");
++        // q_skip: rows whose causal-accessible non-sink range is < K. With causal
++        // bottom-right alignment, row q sees kv [0, q + S_k - S_q]; after sink-exclusion
++        // the count is (q + S_k - S_q) - s + 1, so the first fully-populated row is
++        //   q = s + K - 1 - (S_k - S_q) = s + K - 1 - S_k + S_q.
++        int64_t skip_i64 = std::max<int64_t>(0,
++            (int64_t)seqlen_q + exclude_sink_tokens + topk_K - 1 - (int64_t)seqlen_k);
++        topk_q_skip = static_cast<int>(skip_i64);
++        topk_seqlen_q_out = std::max<int64_t>(0, (int64_t)seqlen_q - skip_i64);
++        // Shape: [B, H, S_q_out, K]. Last dim contiguous so probe writes 8 fp32 + 8 i32 sequentially.
++        topk_val = torch::empty({batch_size, num_heads, topk_seqlen_q_out, (int64_t)topk_K}, opts.dtype(at::kFloat));
++        topk_idx = torch::empty({batch_size, num_heads, topk_seqlen_q_out, (int64_t)topk_K}, opts.dtype(at::kInt));
++    } else {
++        // Zero-size placeholders so the public API tuple shape is stable.
++        topk_val = torch::empty({0}, opts.dtype(at::kFloat));
++        topk_idx = torch::empty({0}, opts.dtype(at::kInt));
++    }
++
+     Flash_fwd_params params;
+     set_params_fprop(params,
+                      batch_size,
+@@ -1094,6 +1141,20 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+         }
+     }
+ 
++    // community_kv top-K (Half 2): plumb output ptrs/strides into params.
++    // When return_topk is false or output S_q_out is zero, ptrs are nullptr →
++    // probe.write_to_gmem early-returns. Strides are still computed when non-empty.
++    if (return_topk && topk_seqlen_q_out > 0) {
++        params.topk_val_ptr = topk_val.data_ptr();
++        params.topk_idx_ptr = topk_idx.data_ptr();
++        params.topk_batch_stride = topk_val.stride(0);
++        params.topk_head_stride  = topk_val.stride(1);
++        params.topk_row_stride   = topk_val.stride(2);
++        params.topk_K = static_cast<int>(topk_K);
++        params.topk_kv_start = static_cast<int>(exclude_sink_tokens);
++        params.topk_q_skip = topk_q_skip;
++    }
++
+     #ifdef FLASHATTENTION_DISABLE_LOCAL
+     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+     #endif
+@@ -1143,7 +1204,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+     }
+ 
+     // return {out, softmax_lse};
+-    return {out, softmax_lse, out_accum, softmax_lse_accum};
++    // community_kv top-K (Half 2): always return topk_val/topk_idx; they are zero-size
++    // placeholders when return_topk=False so the public tuple shape is stable.
++    return {out, softmax_lse, out_accum, softmax_lse_accum, topk_val, topk_idx};
+ }
+ 
+ #ifdef FLASHATTENTION_DISABLE_BACKWARD
+@@ -1652,7 +1715,10 @@ TORCH_LIBRARY(flash_attn_3, m) {
+         "Tensor? scheduler_metadata = None,"
+         "int num_splits = 0,"
+         "bool? pack_gqa = None,"
+-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
++        "int sm_margin = 0,"
++        "bool return_topk = False,"
++        "int topk_K = 8,"
++        "int exclude_sink_tokens = 0) -> (Tensor(out!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+     m.def("bwd("
+         "Tensor dout,"
+         "Tensor q,"
+diff --git a/hopper/flash_attn_interface.py b/hopper/flash_attn_interface.py
+index b753a0f..781f646 100644
+--- a/hopper/flash_attn_interface.py
++++ b/hopper/flash_attn_interface.py
+@@ -50,7 +50,10 @@ def _flash_attn_forward(
+         scheduler_metadata=None,
+         num_splits=1,
+         pack_gqa=None,
+-        sm_margin=0):
++        sm_margin=0,
++        return_topk=False,
++        topk_K=8,
++        exclude_sink_tokens=0):
+     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
+     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
+@@ -97,6 +100,9 @@ def _flash_attn_forward(
+         num_splits,
+         pack_gqa,
+         sm_margin,
++        return_topk,
++        topk_K,
++        exclude_sink_tokens,
+     )
+     return out, softmax_lse, *rest
+ 
+diff --git a/hopper/flash_fwd_launch_template.h b/hopper/flash_fwd_launch_template.h
+index b8af297..e93a42d 100644
+--- a/hopper/flash_fwd_launch_template.h
++++ b/hopper/flash_fwd_launch_template.h
+@@ -26,7 +26,7 @@ using namespace cute;
+ 
+ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
+           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
+-          bool PackGQA, bool Split, bool V_colmajor>
++          bool PackGQA, bool Split, bool V_colmajor, int TopK = 8>
+ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
+     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
+@@ -51,8 +51,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
+     using CollectiveMainloop = std::conditional_t<
+         Arch >= 90,
+-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
+-        flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>
++        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, TopK>,
++        flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, TopK>
+     >;
+     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
+ 
+@@ -126,7 +126,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+         params.kv_batch_idx,
+         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
+         params.seqused_q, params.seqused_k,
+-        params.leftpad_k, params.seqlens_rotary
++        params.leftpad_k, params.seqlens_rotary,
++        // community_kv top-K (Half 2): ptrs + strides plumbed into mainloop args;
++        // mainloop's compile-time gate (bf16 + headdim128 + PackGQA + !FP8) decides
++        // whether the probe instantiates as the real probe or the no-op stub.
++        static_cast<float*>(params.topk_val_ptr),
++        static_cast<int32_t*>(params.topk_idx_ptr),
++        params.topk_batch_stride, params.topk_head_stride, params.topk_row_stride,
++        params.topk_kv_start, params.topk_q_skip
+     };
+     typename CollectiveEpilogue::Arguments epilogue_args {
+         static_cast<ElementOut*>(params.o_ptr),
+@@ -213,7 +220,20 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+                         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+                         CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                             static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
+-                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor>(params, stream);
++                            // community_kv top-K: only multiplicatively dispatch on TopK when
++                            // the kernel could possibly enable the probe. Mirrors the kProbeEnabled
++                            // gate in mainloop_fwd_sm90 to keep build cost bounded — non-probe-eligible
++                            // kernels don't get 4x instantiations.
++                            constexpr bool kCanProbe = (Arch >= 90)
++                                && cute::is_same_v<T, cutlass::bfloat16_t>
++                                && (kHeadDimV == 128) && PackGQA && !PagedKVNonTMA;
++                            if constexpr (kCanProbe) {
++                                TOPK_SWITCH(params.topk_K, TopK_, [&] {
++                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, TopK_>(params, stream);
++                                });
++                            } else {
++                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, 8>(params, stream);
++                            }
+                         });
+                     });
+                 });
+diff --git a/hopper/mainloop_fwd_sm80.hpp b/hopper/mainloop_fwd_sm80.hpp
+index 297927b..c8810d3 100644
+--- a/hopper/mainloop_fwd_sm80.hpp
++++ b/hopper/mainloop_fwd_sm80.hpp
+@@ -25,7 +25,7 @@ using namespace cute;
+ 
+ template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
+         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
+-        bool PackGQA_, bool Split_>
++        bool PackGQA_, bool Split_, int TopK_ = 8>
+ struct CollectiveMainloopFwdSm80 {
+ 
+     static constexpr int kStages = Stages;
+@@ -213,6 +213,16 @@ struct CollectiveMainloopFwdSm80 {
+         int const* const seqused_k = nullptr;
+         int const* const leftpad_k = nullptr;
+         int const* const seqlens_rotary = nullptr;
++        // community_kv top-K (Half 2): unused on SM80 (probe is SM90-only). Fields match
++        // SM90 mainloop Arguments so flash_fwd_launch_template's mainloop_args braced-init
++        // is shape-compatible across both archs. SM80 path simply ignores them.
++        float*   const ptr_topk_val = nullptr;
++        int32_t* const ptr_topk_idx = nullptr;
++        int64_t  const topk_batch_stride = 0;
++        int64_t  const topk_head_stride  = 0;
++        int64_t  const topk_row_stride   = 0;
++        int      const topk_kv_start = 0;
++        int      const topk_q_skip   = 0;
+     };
+ 
+     // Device side kernel params
+diff --git a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+index 536ff85..adf8992 100644
+--- a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
++++ b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+@@ -22,6 +22,7 @@
+ #include "paged_kv.h"
+ #include "rotary.h"
+ #include "utils.h"
++#include "topk_warpselect_probe.h"
+ #include "sm90_pipeline_no_cluster.hpp"
+ 
+ namespace flash {
+@@ -30,7 +31,7 @@ using namespace cute;
+ 
+ template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
+         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
+-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
++        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, int TopK_ = 8>
+ struct CollectiveMainloopFwdSm90 {
+ 
+     static constexpr int kStages = Stages;
+@@ -396,9 +397,24 @@ struct CollectiveMainloopFwdSm90 {
+         int const* const seqused_k = nullptr;
+         int const* const leftpad_k = nullptr;
+         int const* const seqlens_rotary = nullptr;
++        // community_kv top-K (Half 2): when ptr_topk_val != nullptr, the probe writes
++        //   topk_val[B,H,Sq,K] (fp32, normalized softmax probs) and
++        //   topk_idx[B,H,Sq,K] (int32, absolute kv index in [0, seqlen_k)).
++        //   K matches the TopK_ template parameter (dispatched in run_mha_fwd_ via
++        //   TOPK_SWITCH). Only active for the gated target template tuple; passes
++        //   through as nullptr otherwise.
++        float*   const ptr_topk_val = nullptr;
++        int32_t* const ptr_topk_idx = nullptr;
++        int64_t  const topk_batch_stride = 0;
++        int64_t  const topk_head_stride  = 0;
++        int64_t  const topk_row_stride   = 0;
++        // community_kv top-K sink/skip controls (default: no-op).
++        //   topk_kv_start: exclude kv columns [0, topk_kv_start) from candidates.
++        //   topk_q_skip:   skip the first topk_q_skip q-rows (computed host-side from
++        //                  S_q + s + k - 1 - S_k); output row = q_idx - topk_q_skip.
++        int      const topk_kv_start = 0;
++        int      const topk_q_skip   = 0;
+     };
+-
+-    // Device side kernel params
+     struct Params {
+         Element const* const ptr_Q;
+         ShapeQKV const shape_Q;
+@@ -453,6 +469,14 @@ struct CollectiveMainloopFwdSm90 {
+         int const* const seqused_k = nullptr;
+         int const* const leftpad_k = nullptr;
+         int const *const seqlens_rotary = nullptr;
++        // community_kv top-K (Half 2): see Arguments for semantics.
++        float*   const ptr_topk_val = nullptr;
++        int32_t* const ptr_topk_idx = nullptr;
++        int64_t  const topk_batch_stride = 0;
++        int64_t  const topk_head_stride  = 0;
++        int64_t  const topk_row_stride   = 0;
++        int      const topk_kv_start = 0;
++        int      const topk_q_skip   = 0;
+     };
+ 
+     static Params
+@@ -564,7 +588,10 @@ struct CollectiveMainloopFwdSm90 {
+                 !Split ? 1 : args.num_splits,
+                 args.kv_batch_idx,
+                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
++                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
++                args.ptr_topk_val, args.ptr_topk_idx,
++                args.topk_batch_stride, args.topk_head_stride, args.topk_row_stride,
++                args.topk_kv_start, args.topk_q_skip};
+     }
+ 
+     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+@@ -983,6 +1010,18 @@ struct CollectiveMainloopFwdSm90 {
+             if (n_block_max <= n_block_min) { return false; }
+         }
+ 
++        // Compile-time gate: only instantiate the real probe for the target
++        // template tuple (bf16 + kHeadDimV=128 + PackGQA + !PagedKVNonTMA + !FP8).
++        // All other instantiations get an empty no-op stub.
++        static constexpr bool kProbeEnabled =
++            cute::is_same_v<Element, cutlass::bfloat16_t> &&
++            kHeadDimV == 128 && PackGQA && !PagedKVNonTMA && !Is_FP8;
++        using ProbeT = std::conditional_t<
++            kProbeEnabled,
++            flash::WarpSelectProbe<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, TopK_, 16>,
++            flash::WarpSelectProbeNoOp>;
++        ProbeT probe;
++
+         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
+         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
+@@ -1040,6 +1079,11 @@ struct CollectiveMainloopFwdSm90 {
+         Tensor taccOcO = thread_mma_pv.partition_C(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
+         Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
+         Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
++        // Per-thread (row,col) coordinates of the QK accumulator fragment.
++        // Used by the WarpSelect probe to map fragment cols to absolute kv indices.
++        auto thread_mma_qk_for_probe = tiled_mma_qk.get_thread_slice(thread_idx);
++        Tensor tScS_probe = thread_mma_qk_for_probe.partition_C(cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}));
++        Tensor tScS_probe_rc = make_tensor(tScS_probe.data(), flash::convert_layout_acc_rowcol(tScS_probe.layout()));
+         auto store_scales = [&](auto& scales, int stage) {
+             static_assert(CUTE_STATIC_V(size(scales)) == CUTE_STATIC_V(size(taccOcO_row)));
+             #pragma unroll
+@@ -1148,6 +1192,8 @@ struct CollectiveMainloopFwdSm90 {
+             }
+             scoremod_premask_fn(tSrS);
+             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
++            { auto scores_rc = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
++              probe.update(scores_rc, tScS_probe_rc, n_block * kBlockN, params.topk_kv_start); }
+ 
+             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
+@@ -1191,6 +1237,8 @@ struct CollectiveMainloopFwdSm90 {
+                 }
+                 scoremod_premask_fn(tSrS);
+                 mask_fn(tSrS, n_block);
++                { auto scores_rc = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
++                  probe.update(scores_rc, tScS_probe_rc, n_block * kBlockN, params.topk_kv_start); }
+                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
+                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
+                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+@@ -1280,6 +1328,8 @@ struct CollectiveMainloopFwdSm90 {
+                 }
+                 scoremod_premask_fn(tSrS);
+                 mask_fn(tSrS, n_block);
++                { auto scores_rc = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
++                  probe.update(scores_rc, tScS_probe_rc, n_block * kBlockN, params.topk_kv_start); }
+                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
+                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+@@ -1347,6 +1397,24 @@ struct CollectiveMainloopFwdSm90 {
+             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+             ++smem_pipe_read;
+         }
++        // Drain buffer, cross-quad merge, normalize topk values to softmax probs.
++        // softmax.row_sum holds LSE_natural at this point (Softmax::finalize was just called).
++        probe.finalize_and_normalize(softmax.softmax_scale_log2, softmax.row_max, softmax.row_sum);
++        // Half 2: write top-K (val, idx) to gmem. Runtime-gated by params.ptr_topk_val.
++        // qhead_per_khead==1 when !PackGQA; the probe handles both paths uniformly.
++        probe.write_to_gmem(
++            tScS_probe_rc,
++            m_block * kBlockM,
++            bidh,
++            bidb,
++            params.qhead_per_khead_divmod.divisor,
++            seqlen_info.seqlen_q,
++            params.topk_q_skip,
++            params.ptr_topk_val,
++            params.ptr_topk_idx,
++            params.topk_batch_stride,
++            params.topk_head_stride,
++            params.topk_row_stride);
+         ++work_idx;
+         return true;
+     }
+diff --git a/hopper/static_switch.h b/hopper/static_switch.h
+index 5e13b5f..718a495 100644
+--- a/hopper/static_switch.h
++++ b/hopper/static_switch.h
+@@ -179,3 +179,27 @@
+       return __VA_ARGS__();                                                                      \
+     }                                                                                            \
+   }()
++
++// community_kv top-K: dispatch params.topk_K (runtime) to a compile-time
++// constant TOPK_NAME. Limited to {2, 4, 8, 16, 32} — the supported probe widths.
++// Default to 8 outside this set so non-probe paths remain valid; flash_api
++// validates topk_K independently when return_topk=true.
++#define TOPK_SWITCH(TOPK_VAL, TOPK_NAME, ...)                                                    \
++  [&] {                                                                                          \
++    if (TOPK_VAL == 2) {                                                                         \
++      constexpr static int TOPK_NAME = 2;                                                        \
++      return __VA_ARGS__();                                                                      \
++    } else if (TOPK_VAL == 4) {                                                                  \
++      constexpr static int TOPK_NAME = 4;                                                        \
++      return __VA_ARGS__();                                                                      \
++    } else if (TOPK_VAL == 16) {                                                                 \
++      constexpr static int TOPK_NAME = 16;                                                       \
++      return __VA_ARGS__();                                                                      \
++    } else if (TOPK_VAL == 32) {                                                                 \
++      constexpr static int TOPK_NAME = 32;                                                       \
++      return __VA_ARGS__();                                                                      \
++    } else {                                                                                     \
++      constexpr static int TOPK_NAME = 8;                                                        \
++      return __VA_ARGS__();                                                                      \
++    }                                                                                            \
++  }()
+diff --git a/hopper/topk_warpselect_probe.h b/hopper/topk_warpselect_probe.h
+new file mode 100644
+index 0000000..372ce96
+--- /dev/null
++++ b/hopper/topk_warpselect_probe.h
+@@ -0,0 +1,298 @@
++/******************************************************************************
++ * community_kv: per-thread WarpSelect-style top-K probe with cross-quad merge.
++ *
++ *   Phase 5e (A) Half 1 — kernel-internal only.
++ *
++ *   Per-thread state:
++ *     - topk_v[r][K], topk_i[r][K]  : sorted DESCENDING (topk_v[r][K-1] = tau)
++ *     - buf_v[r][B],  buf_i[r][B]   : unsorted overflow
++ *     - buf_count[r]
++ *
++ *   update(scores, coord_rc, n_block_offset):
++ *     for each col: if score > tau, push (score, n_block_offset + coord_col)
++ *                   if buf full, merge_row and reset
++ *
++ *   merge_row(r):
++ *     pad (topk_v + buf_v) up to NextPow2 with -INF
++ *     bitonic-sort DESC, take first K
++ *
++ *   finalize_and_normalize(softmax_scale_log2, row_max, lse_natural):
++ *     1. drain buffer for each row
++ *     2. cross-quad butterfly merge (delta=1, delta=2) so each row-mate thread
++ *        ends up with the same union top-K of the row's 4 row-mate threads
++ *     3. (Half 1) keep_alive via inline asm so ptxas doesn't DCE everything
++ *
++ *   This is "Variant A": cross-quad merge during finalize. Cross-quad merge in
++ *   the streaming update path is left for a follow-up if measurements warrant.
++ *
++ * NO memory write yet (Half 1). NO inter-warp sync. K is a template parameter
++ * (callers in CommunityKV dispatch over {2, 4, 8, 16, 32}); B=16 fixed.
++ ******************************************************************************/
++
++#pragma once
++
++#include <cute/tensor.hpp>
++#include <cutlass/numeric_types.h>
++
++namespace flash {
++
++using namespace cute;
++
++// Bitonic sort DESCENDING: a[0] = max, a[N-1] = min.
++template <int N>
++CUTLASS_DEVICE void bitonic_sort_desc_kv(float* v, int* idx) {
++    static_assert((N & (N - 1)) == 0, "N must be power of 2");
++    #pragma unroll
++    for (int k = 2; k <= N; k *= 2) {
++        #pragma unroll
++        for (int j = k / 2; j > 0; j /= 2) {
++            #pragma unroll
++            for (int i = 0; i < N; ++i) {
++                int ix = i ^ j;
++                if (ix > i) {
++                    bool descending = ((i & k) == 0);
++                    bool need_swap = descending ? (v[i] < v[ix]) : (v[i] > v[ix]);
++                    if (need_swap) {
++                        float tv = v[i]; v[i] = v[ix]; v[ix] = tv;
++                        int   ti = idx[i]; idx[i] = idx[ix]; idx[ix] = ti;
++                    }
++                }
++            }
++        }
++    }
++}
++
++// 2-way merge of two DESC-sorted lists of length K, keep top-K.
++// `a_v`, `a_i` are the local thread's list (and the destination).
++// `b_v`, `b_i` are the other thread's list (received via shfl_xor).
++template <int K>
++CUTLASS_DEVICE void merge_two_desc_keep_top_k(
++        float* a_v, int* a_i,
++        float const* b_v, int const* b_i)
++{
++    float out_v[K]; int out_i[K];
++    int ai = 0, bi = 0;
++    #pragma unroll
++    for (int k = 0; k < K; ++k) {
++        // pick the larger head; on tie, prefer a's
++        bool take_a = (ai < K) && (bi >= K || a_v[ai] >= b_v[bi]);
++        out_v[k] = take_a ? a_v[ai] : b_v[bi];
++        out_i[k] = take_a ? a_i[ai] : b_i[bi];
++        ai += take_a ? 1 : 0;
++        bi += take_a ? 0 : 1;
++    }
++    #pragma unroll
++    for (int k = 0; k < K; ++k) { a_v[k] = out_v[k]; a_i[k] = out_i[k]; }
++}
++
++template <int kNRows, int K, int B>
++struct WarpSelectProbe {
++    static_assert((K & (K - 1)) == 0, "K must be power of 2");
++    static_assert((B & (B - 1)) == 0, "B must be power of 2");
++    static constexpr int Combined = K + B;
++    static constexpr int NextPow2 =
++        (Combined <= 16)  ? 16  :
++        (Combined <= 32)  ? 32  :
++        (Combined <= 64)  ? 64  :
++        (Combined <= 128) ? 128 : 256;
++
++    float topk_v[kNRows][K];   // DESC, topk_v[r][K-1] = tau
++    int   topk_i[kNRows][K];
++    float buf_v [kNRows][B];
++    int   buf_i [kNRows][B];
++    int   buf_count[kNRows];
++
++    CUTLASS_DEVICE WarpSelectProbe() {
++        #pragma unroll
++        for (int r = 0; r < kNRows; ++r) {
++            buf_count[r] = 0;
++            #pragma unroll
++            for (int k = 0; k < K; ++k) { topk_v[r][k] = -INFINITY; topk_i[r][k] = -1; }
++            #pragma unroll
++            for (int b = 0; b < B; ++b) { buf_v [r][b] = -INFINITY; buf_i [r][b] = -1; }
++        }
++    }
++
++    // Combine topk(K) + buf(count) into NextPow2 padded with -INF, bitonic-sort DESC,
++    // keep first K (largest). buf contents are discarded (count reset by caller).
++    // `count` is the number of VALID entries in buf_v[r][0..count); entries past count
++    // may be stale from a previous fill (we reset only the count, not the values).
++    CUTLASS_DEVICE void merge_row(int r, int count) {
++        float c_v[NextPow2]; int c_i[NextPow2];
++        #pragma unroll
++        for (int k = 0; k < K; ++k) { c_v[k] = topk_v[r][k]; c_i[k] = topk_i[r][k]; }
++        #pragma unroll
++        for (int b = 0; b < B; ++b) {
++            bool valid = b < count;
++            c_v[K + b] = valid ? buf_v[r][b] : -INFINITY;
++            c_i[K + b] = valid ? buf_i[r][b] : -1;
++        }
++        #pragma unroll
++        for (int i = Combined; i < NextPow2; ++i) { c_v[i] = -INFINITY; c_i[i] = -1; }
++        bitonic_sort_desc_kv<NextPow2>(c_v, c_i);
++        #pragma unroll
++        for (int k = 0; k < K; ++k) { topk_v[r][k] = c_v[k]; topk_i[r][k] = c_i[k]; }
++    }
++
++    // scores: rowcol-converted accumulator fragment, shape (kNRows, ncol).
++    // coord:  same shape, holds (row,col) pairs from a partitioned identity tensor.
++    // n_block_offset: absolute kv col index of column 0 in this n-block.
++    // kv_start: exclude kv cols [0, kv_start) from candidates (sink tokens).
++    template <typename ScoresT, typename CoordT>
++    CUTLASS_DEVICE void update(ScoresT const& scores, CoordT const& coord, int n_block_offset, int kv_start) {
++        constexpr int ncol = decltype(size<1>(scores))::value;
++        #pragma unroll
++        for (int r = 0; r < kNRows; ++r) {
++            float tau   = topk_v[r][K - 1];
++            int   count = buf_count[r];
++            #pragma unroll
++            for (int c = 0; c < ncol; ++c) {
++                float val = scores(r, c);
++                int abs_col = n_block_offset + get<1>(coord(r, c));
++                if (val > tau && abs_col >= kv_start) {
++                    buf_v[r][count] = val;
++                    buf_i[r][count] = abs_col;
++                    ++count;
++                    if (count == B) {
++                        merge_row(r, B);
++                        count = 0;
++                        tau   = topk_v[r][K - 1];
++                    }
++                }
++            }
++            buf_count[r] = count;
++        }
++    }
++
++    // Drain buffer + cross-quad butterfly merge.
++    // After this returns, all 4 row-mate lanes hold the same top-K of the row's
++    // union state. softmax_scale_log2 + lse_natural normalize values to softmax
++    // probabilities (kept inline, not yet written to gmem in Half 1).
++    //
++    // row_max / lse_natural are held by the Softmax struct after Softmax::finalize.
++    template <typename TensorMax, typename TensorLse>
++    CUTLASS_DEVICE void finalize_and_normalize(
++            float softmax_scale_log2,
++            TensorMax const& row_max,
++            TensorLse  const& lse_natural)
++    {
++        (void)row_max;  // currently unused; reserved for future per-row sanity asserts
++
++        #pragma unroll
++        for (int r = 0; r < kNRows; ++r) {
++            // 1. Drain remaining buffer entries
++            if (buf_count[r] > 0) {
++                merge_row(r, buf_count[r]);
++                buf_count[r] = 0;
++            }
++
++            // 2. Cross-quad butterfly merge: delta=1 then delta=2.
++            //    After both, every row-mate lane holds the union top-K.
++            #pragma unroll
++            for (int delta = 1; delta <= 2; delta <<= 1) {
++                float other_v[K]; int other_i[K];
++                #pragma unroll
++                for (int k = 0; k < K; ++k) {
++                    other_v[k] = __shfl_xor_sync(0xffffffff, topk_v[r][k], delta);
++                    other_i[k] = __shfl_xor_sync(0xffffffff, topk_i[r][k], delta);
++                }
++                merge_two_desc_keep_top_k<K>(topk_v[r], topk_i[r], other_v, other_i);
++            }
++
++            // 3. Normalize values to softmax probabilities.
++            //    P(s) = exp2(s * scale_log2 - LSE * log2(e))
++            //    where LSE_natural = log(Z_natural) and the exp2 form matches FA3's exp path.
++            float const lse_log2 = lse_natural(r) * float(M_LOG2E);
++            #pragma unroll
++            for (int k = 0; k < K; ++k) {
++                topk_v[r][k] = exp2f(topk_v[r][k] * softmax_scale_log2 - lse_log2);
++            }
++        }
++    }
++
++    // Force ptxas to keep the running topk live in Half 1 (no gmem write yet).
++    CUTLASS_DEVICE void keep_alive() {
++        #pragma unroll
++        for (int r = 0; r < kNRows; ++r) {
++            #pragma unroll
++            for (int k = 0; k < K; ++k) {
++                asm volatile("" :: "f"(topk_v[r][k]));
++                asm volatile("" :: "r"(topk_i[r][k]));
++            }
++        }
++    }
++
++    // Half 2: write top-K (val, idx) to gmem.
++    //   coord_rc          : per-thread (row,col) coords of the QK accumulator fragment
++    //                       (same one fed to update()), used to elect ONE thread per row to
++    //                       write and to recover the in-block row index.
++    //   m_block_row_offset: m_block * kBlockM (caller pre-folds; probe doesn't know kBlockM).
++    //   bidh              : head-id (kv-head when PackGQA) from block_coord
++    //   bidb              : batch-id from block_coord
++    //   qhead_per_khead   : 1 when !PackGQA; otherwise H / H_kv
++    //   seqlen_q          : query seqlen for OOB check
++    //   q_skip            : skip the first q_skip q-rows; output is allocated as
++    //                       [B, H, seqlen_q - q_skip, K] and we write to row (q_idx - q_skip).
++    //   ptr_val/ptr_idx   : base ptrs to topk_val [B,H,Sq-q_skip,K] fp32 / topk_idx int32.
++    //                       If either is nullptr, write is skipped (cheap runtime gate).
++    //   stride_b/h/row    : strides in elements for batch/head/row dims (last dim is contiguous).
++    template <typename CoordT>
++    CUTLASS_DEVICE void write_to_gmem(
++            CoordT const& coord_rc,
++            int m_block_row_offset,
++            int bidh,
++            int bidb,
++            int qhead_per_khead,
++            int seqlen_q,
++            int q_skip,
++            float*  ptr_val,
++            int32_t* ptr_idx,
++            int64_t stride_batch,
++            int64_t stride_head,
++            int64_t stride_row)
++    {
++        if (ptr_val == nullptr || ptr_idx == nullptr) return;
++        #pragma unroll
++        for (int r = 0; r < kNRows; ++r) {
++            // Elect one thread per row: the row-mate lane whose col coord is 0.
++            // After cross-quad butterfly merge in finalize_and_normalize(), all 4 row-mate
++            // lanes hold the same union top-K, so any one writer suffices.
++            if (get<1>(coord_rc(r, _0{})) != 0) continue;
++
++            int const row_in_block = get<0>(coord_rc(r, _0{}));
++            int const abs_row = m_block_row_offset + row_in_block;
++            int const h_inner = (qhead_per_khead == 1) ? 0 : (abs_row % qhead_per_khead);
++            int const q_idx   = (qhead_per_khead == 1) ? abs_row : (abs_row / qhead_per_khead);
++            int const abs_h   = bidh * qhead_per_khead + h_inner;
++            if (q_idx >= seqlen_q || q_idx < q_skip) continue;
++            int const out_row = q_idx - q_skip;
++
++            int64_t const base = int64_t(bidb) * stride_batch
++                               + int64_t(abs_h) * stride_head
++                               + int64_t(out_row) * stride_row;
++            float*   row_val  = ptr_val + base;
++            int32_t* row_idxp = ptr_idx + base;
++            #pragma unroll
++            for (int k = 0; k < K; ++k) {
++                row_val[k]  = topk_v[r][k];
++                row_idxp[k] = topk_i[r][k];
++            }
++        }
++    }
++};
++
++// Empty stub used in template instantiations where we don't want the probe.
++struct WarpSelectProbeNoOp {
++    CUTLASS_DEVICE WarpSelectProbeNoOp() {}
++    template <typename ScoresT, typename CoordT>
++    CUTLASS_DEVICE void update(ScoresT const&, CoordT const&, int, int) {}
++    template <typename TensorMax, typename TensorLse>
++    CUTLASS_DEVICE void finalize_and_normalize(float, TensorMax const&, TensorLse const&) {}
++    CUTLASS_DEVICE void keep_alive() {}
++    template <typename CoordT>
++    CUTLASS_DEVICE void write_to_gmem(
++            CoordT const&, int, int, int, int, int, int,
++            float*, int32_t*, int64_t, int64_t, int64_t) {}
++};
++
++}  // namespace flash

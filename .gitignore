@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+.build/
+dist/
+*.egg-info/
+**/__pycache__/
+**/*.so
+**/*.o
+**/*.cubin
+**/*.pyc
+.pytest_cache/
+
+# Local-only / generated data
+*.pftrace
+agent_artifacts/
+discovered_resolutions*.json
+
+# Offline tuning scripting (operational, not part of the package release).
+# Only the tuned resolutions.json artifact ships.
+scripts/
