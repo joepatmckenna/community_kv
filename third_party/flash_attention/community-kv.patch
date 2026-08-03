@@ -1,0 +1,723 @@
+diff --git a/hopper/flash.h b/hopper/flash.h
+index bee89e5..eaa35b7 100644
+--- a/hopper/flash.h
++++ b/hopper/flash.h
+@@ -159,6 +159,17 @@ struct Flash_fwd_params : public Qkv_params {
+ 
+     int arch;
+     int num_sm;
++
++    // CommunityKV top-8 outputs. Selection is enabled only for the SM90 BF16,
++    // head-dimension-128 PackGQA specialization.
++    void*   topk_val_ptr = nullptr;
++    void*   topk_idx_ptr = nullptr;
++    index_t topk_batch_stride = 0;
++    index_t topk_head_stride  = 0;
++    index_t topk_row_stride   = 0;
++    // Exclude sink columns and rows without eight eligible causal keys.
++    int     topk_kv_start     = 0;
++    int     topk_q_skip       = 0;
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
+index 33185bf..e3f5eed 100644
+--- a/hopper/flash_api.cpp
++++ b/hopper/flash_api.cpp
+@@ -634,7 +634,7 @@ mha_fwd_get_scheduler_metadata(
+ // h: num_heads
+ // h_k: num_heads_k
+ // d: head_size
+-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
++std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+         at::Tensor k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
+         at::Tensor v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
+@@ -669,7 +669,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
+         int64_t num_splits,
+         std::optional<bool> pack_gqa_,
+-        int64_t sm_margin
++        int64_t sm_margin,
++        // Exclude sink columns from CommunityKV's fixed top-8 output.
++        int64_t exclude_sink_tokens
+         ) {
+ 
+     auto dprops = at::cuda::getCurrentDeviceProperties();
+@@ -856,6 +858,39 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+         softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+     }
+ 
++    constexpr int kTopK = 8;
++    TORCH_CHECK(dprops->major == 9,
++                "CommunityKV FlashAttention requires an SM90 GPU");
++    TORCH_CHECK(q_type == at::ScalarType::BFloat16,
++                "CommunityKV FlashAttention requires bfloat16 q/k/v");
++    TORCH_CHECK(head_size == 128 && head_size_v == 128,
++                "CommunityKV FlashAttention requires head dimension 128");
++    TORCH_CHECK(is_causal,
++                "CommunityKV FlashAttention requires causal attention");
++    TORCH_CHECK(pack_gqa_.value_or(false),
++                "CommunityKV FlashAttention requires PackGQA");
++    TORCH_CHECK(!paged_KV && !is_varlen_q && !is_varlen_k,
++                "CommunityKV FlashAttention requires dense fixed-length K/V");
++    TORCH_CHECK(!k_new_.has_value() && softcap == 0.0 && num_splits == 1,
++                "CommunityKV FlashAttention received an unsupported configuration");
++    TORCH_CHECK(exclude_sink_tokens >= 0,
++                "exclude_sink_tokens must be non-negative");
++
++    // Rows without eight eligible causal keys are omitted from the top-8 output.
++    int64_t skip_i64 = std::max<int64_t>(
++        0,
++        (int64_t)seqlen_q + exclude_sink_tokens + kTopK - 1
++            - (int64_t)seqlen_k);
++    int topk_q_skip = static_cast<int>(skip_i64);
++    int64_t topk_seqlen_q_out =
++        std::max<int64_t>(0, (int64_t)seqlen_q - skip_i64);
++    at::Tensor topk_val = torch::empty(
++        {batch_size, num_heads, topk_seqlen_q_out, kTopK},
++        opts.dtype(at::kFloat));
++    at::Tensor topk_idx = torch::empty(
++        {batch_size, num_heads, topk_seqlen_q_out, kTopK},
++        opts.dtype(at::kInt));
++
+     Flash_fwd_params params;
+     set_params_fprop(params,
+                      batch_size,
+@@ -1094,6 +1129,16 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+         }
+     }
+ 
++    if (topk_seqlen_q_out > 0) {
++        params.topk_val_ptr = topk_val.data_ptr();
++        params.topk_idx_ptr = topk_idx.data_ptr();
++        params.topk_batch_stride = topk_val.stride(0);
++        params.topk_head_stride  = topk_val.stride(1);
++        params.topk_row_stride   = topk_val.stride(2);
++        params.topk_kv_start = static_cast<int>(exclude_sink_tokens);
++        params.topk_q_skip = topk_q_skip;
++    }
++
+     #ifdef FLASHATTENTION_DISABLE_LOCAL
+     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+     #endif
+@@ -1142,8 +1187,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+         softmax_lse.fill_(std::numeric_limits<float>::infinity());
+     }
+ 
+-    // return {out, softmax_lse};
+-    return {out, softmax_lse, out_accum, softmax_lse_accum};
++    return {out, softmax_lse, out_accum, softmax_lse_accum, topk_val, topk_idx};
+ }
+ 
+ #ifdef FLASHATTENTION_DISABLE_BACKWARD
+@@ -1652,7 +1696,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
+         "Tensor? scheduler_metadata = None,"
+         "int num_splits = 0,"
+         "bool? pack_gqa = None,"
+-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
++        "int sm_margin = 0,"
++        "int exclude_sink_tokens = 0) -> (Tensor(out!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+     m.def("bwd("
+         "Tensor dout,"
+         "Tensor q,"
+diff --git a/hopper/flash_fwd_launch_template.h b/hopper/flash_fwd_launch_template.h
+index b8af297..3af2349 100644
+--- a/hopper/flash_fwd_launch_template.h
++++ b/hopper/flash_fwd_launch_template.h
+@@ -126,7 +126,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+         params.kv_batch_idx,
+         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
+         params.seqused_q, params.seqused_k,
+-        params.leftpad_k, params.seqlens_rotary
++        params.leftpad_k, params.seqlens_rotary,
++        // CommunityKV top-8 outputs.
++        static_cast<float*>(params.topk_val_ptr),
++        static_cast<int32_t*>(params.topk_idx_ptr),
++        params.topk_batch_stride, params.topk_head_stride, params.topk_row_stride,
++        params.topk_kv_start, params.topk_q_skip
+     };
+     typename CollectiveEpilogue::Arguments epilogue_args {
+         static_cast<ElementOut*>(params.o_ptr),
+@@ -199,6 +204,17 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
+     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
+     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
++#ifdef COMMUNITY_KV_TOPK_SPECIALIZATION
++    static_assert(
++        Arch == 90 && cute::is_same_v<T, cutlass::bfloat16_t> &&
++        kHeadDim == 128 && kHeadDimV == 128 && !Split &&
++        !PagedKVNonTMA && !Has_softcap && PackGQA,
++        "CommunityKV top-k build only supports the SM90 BF16 PackGQA path");
++    run_flash_fwd<
++        90, 128, 128, 1, cutlass::bfloat16_t, cutlass::bfloat16_t,
++        true, false, false, false, false, false, false, true, false, false
++    >(params, stream);
++#else
+     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
+             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
+@@ -220,4 +236,5 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+             });
+         });
+     });
++#endif
+ }
+diff --git a/hopper/mainloop_fwd_sm80.hpp b/hopper/mainloop_fwd_sm80.hpp
+index 297927b..ec0af3e 100644
+--- a/hopper/mainloop_fwd_sm80.hpp
++++ b/hopper/mainloop_fwd_sm80.hpp
+@@ -213,6 +213,14 @@ struct CollectiveMainloopFwdSm80 {
+         int const* const seqused_k = nullptr;
+         int const* const leftpad_k = nullptr;
+         int const* const seqlens_rotary = nullptr;
++        // Keep argument shape compatible with the SM90 CommunityKV specialization.
++        float*   const ptr_topk_val = nullptr;
++        int32_t* const ptr_topk_idx = nullptr;
++        int64_t  const topk_batch_stride = 0;
++        int64_t  const topk_head_stride  = 0;
++        int64_t  const topk_row_stride   = 0;
++        int      const topk_kv_start = 0;
++        int      const topk_q_skip   = 0;
+     };
+ 
+     // Device side kernel params
+diff --git a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+index 536ff85..162af23 100644
+--- a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
++++ b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+@@ -22,6 +22,9 @@
+ #include "paged_kv.h"
+ #include "rotary.h"
+ #include "utils.h"
++#if defined(COMMUNITY_KV_TOPK_SELECTION)
++#include "topk_warpselect.h"
++#endif
+ #include "sm90_pipeline_no_cluster.hpp"
+ 
+ namespace flash {
+@@ -396,9 +399,17 @@ struct CollectiveMainloopFwdSm90 {
+         int const* const seqused_k = nullptr;
+         int const* const leftpad_k = nullptr;
+         int const* const seqlens_rotary = nullptr;
++        // CommunityKV top-8 output: normalized probabilities and absolute K/V
++        // indices in [topk_kv_start, seqlen_k).
++        float*   const ptr_topk_val = nullptr;
++        int32_t* const ptr_topk_idx = nullptr;
++        int64_t  const topk_batch_stride = 0;
++        int64_t  const topk_head_stride  = 0;
++        int64_t  const topk_row_stride   = 0;
++        // Exclude sink columns and rows without eight eligible causal keys.
++        int      const topk_kv_start = 0;
++        int      const topk_q_skip   = 0;
+     };
+-
+-    // Device side kernel params
+     struct Params {
+         Element const* const ptr_Q;
+         ShapeQKV const shape_Q;
+@@ -453,6 +464,14 @@ struct CollectiveMainloopFwdSm90 {
+         int const* const seqused_k = nullptr;
+         int const* const leftpad_k = nullptr;
+         int const *const seqlens_rotary = nullptr;
++        // CommunityKV top-8 output; see Arguments for semantics.
++        float*   const ptr_topk_val = nullptr;
++        int32_t* const ptr_topk_idx = nullptr;
++        int64_t  const topk_batch_stride = 0;
++        int64_t  const topk_head_stride  = 0;
++        int64_t  const topk_row_stride   = 0;
++        int      const topk_kv_start = 0;
++        int      const topk_q_skip   = 0;
+     };
+ 
+     static Params
+@@ -564,7 +583,10 @@ struct CollectiveMainloopFwdSm90 {
+                 !Split ? 1 : args.num_splits,
+                 args.kv_batch_idx,
+                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
++                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
++                args.ptr_topk_val, args.ptr_topk_idx,
++                args.topk_batch_stride, args.topk_head_stride, args.topk_row_stride,
++                args.topk_kv_start, args.topk_q_skip};
+     }
+ 
+     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+@@ -983,6 +1005,17 @@ struct CollectiveMainloopFwdSm90 {
+             if (n_block_max <= n_block_min) { return false; }
+         }
+ 
++#if defined(COMMUNITY_KV_TOPK_SELECTION)
++        static_assert(
++            cute::is_same_v<Element, cutlass::bfloat16_t> &&
++            kHeadDimV == 128 && PackGQA && !PagedKVNonTMA && !Is_FP8,
++            "CommunityKV top-8 selection requires SM90 BF16 PackGQA");
++        flash::WarpSelect<
++            !LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2,
++            8,
++            16> selector;
++#endif
++
+         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
+         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
+@@ -1040,6 +1073,13 @@ struct CollectiveMainloopFwdSm90 {
+         Tensor taccOcO = thread_mma_pv.partition_C(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
+         Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
+         Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
++        // Per-thread (row,col) coordinates of the QK accumulator fragment.
++        // Map QK accumulator columns to absolute K/V positions.
++#if defined(COMMUNITY_KV_TOPK_SELECTION)
++        auto thread_mma_qk_for_selector = tiled_mma_qk.get_thread_slice(thread_idx);
++        Tensor tScS_selector = thread_mma_qk_for_selector.partition_C(cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}));
++        Tensor tScS_selector_rc = make_tensor(tScS_selector.data(), flash::convert_layout_acc_rowcol(tScS_selector.layout()));
++#endif
+         auto store_scales = [&](auto& scales, int stage) {
+             static_assert(CUTE_STATIC_V(size(scales)) == CUTE_STATIC_V(size(taccOcO_row)));
+             #pragma unroll
+@@ -1148,8 +1188,17 @@ struct CollectiveMainloopFwdSm90 {
+             }
+             scoremod_premask_fn(tSrS);
+             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+-
++#if defined(COMMUNITY_KV_TOPK_SELECTION)
++            auto topk_local_max = make_fragment_like(softmax.row_max);
++            Tensor scores_scale = softmax.template max_get_scale_with_local_max<
++                /*Is_first=*/true, /*Check_inf=*/true>(tSrS, topk_local_max);
++            { auto scores_rc = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
++              selector.update_with_local_max(
++                  scores_rc, tScS_selector_rc, n_block * kBlockN,
++                  params.topk_kv_start, topk_local_max); }
++#else
+             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
++#endif
+             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
+ 
+             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+@@ -1191,7 +1240,19 @@ struct CollectiveMainloopFwdSm90 {
+                 }
+                 scoremod_premask_fn(tSrS);
+                 mask_fn(tSrS, n_block);
++#if defined(COMMUNITY_KV_TOPK_SELECTION)
++                auto topk_local_max = make_fragment_like(softmax.row_max);
++                cute::copy(
++                    softmax.template max_get_scale_with_local_max<
++                        /*Is_first=*/false, Check_inf>(tSrS, topk_local_max),
++                    scores_scale);
++                { auto scores_rc = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
++                  selector.update_with_local_max(
++                      scores_rc, tScS_selector_rc, n_block * kBlockN,
++                      params.topk_kv_start, topk_local_max); }
++#else
+                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
++#endif
+                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
+                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+                 if constexpr (!HasQv) {
+@@ -1280,7 +1341,17 @@ struct CollectiveMainloopFwdSm90 {
+                 }
+                 scoremod_premask_fn(tSrS);
+                 mask_fn(tSrS, n_block);
++#if defined(COMMUNITY_KV_TOPK_SELECTION)
++                auto topk_local_max = make_fragment_like(softmax.row_max);
++                Tensor scores_scale = softmax.template max_get_scale_with_local_max<
++                    /*Is_first=*/Is_first_iter, Check_inf>(tSrS, topk_local_max);
++                { auto scores_rc = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
++                  selector.update_with_local_max(
++                      scores_rc, tScS_selector_rc, n_block * kBlockN,
++                      params.topk_kv_start, topk_local_max); }
++#else
+                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
++#endif
+                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
+                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+@@ -1347,6 +1418,25 @@ struct CollectiveMainloopFwdSm90 {
+             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+             ++smem_pipe_read;
+         }
++#if defined(COMMUNITY_KV_TOPK_SELECTION)
++        // Merge lane-local queues and normalize selected scores.
++        selector.finalize_and_normalize(
++            softmax.softmax_scale_log2,
++            softmax.row_sum);
++        selector.write_to_gmem(
++            tScS_selector_rc,
++            m_block * kBlockM,
++            bidh,
++            bidb,
++            params.qhead_per_khead_divmod.divisor,
++            seqlen_info.seqlen_q,
++            params.topk_q_skip,
++            params.ptr_topk_val,
++            params.ptr_topk_idx,
++            params.topk_batch_stride,
++            params.topk_head_stride,
++            params.topk_row_stride);
++#endif
+         ++work_idx;
+         return true;
+     }
+diff --git a/hopper/setup.py b/hopper/setup.py
+index c15c438..a8391d3 100644
+--- a/hopper/setup.py
++++ b/hopper/setup.py
+@@ -154,6 +154,13 @@ def _write_ninja_file(path,
+         flags.append(f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}')
+         cuda_post_cflags_sm100 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_100a,code=sm_100a' for s in cuda_post_cflags]
+         flags.append(f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
++        cuda_post_cflags_community_kv = cuda_post_cflags + [
++            '-DCOMMUNITY_KV_TOPK_SPECIALIZATION',
++            '-DCOMMUNITY_KV_TOPK_SELECTION',
++        ]
++        flags.append(
++            f'cuda_post_cflags_community_kv = {" ".join(cuda_post_cflags_community_kv)}'
++        )
+     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
+     flags.append(f'ldflags = {" ".join(ldflags)}')
+ 
+@@ -194,6 +201,9 @@ def _write_ninja_file(path,
+         cuda_compile_rule_sm100 = ['rule cuda_compile_sm100'] + cuda_compile_rule[1:] + [
+             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm100'
+         ]
++        cuda_compile_rule_community_kv = ['rule cuda_compile_community_kv'] + cuda_compile_rule[1:] + [
++            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_community_kv'
++        ]
+         cuda_compile_rule.append(
+             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags')
+ 
+@@ -202,7 +212,9 @@ def _write_ninja_file(path,
+     for source_file, object_file in zip(sources, objects):
+         is_cuda_source = _is_cuda_file(source_file) and with_cuda
+         if is_cuda_source:
+-            if source_file.endswith('_sm90.cu'):
++            if source_file.endswith('flash_fwd_hdimall_bf16_packgqa_sm90.cu'):
++                rule = 'cuda_compile_community_kv'
++            elif source_file.endswith('_sm90.cu'):
+                 rule = 'cuda_compile'
+             elif source_file.endswith('_sm80.cu'):
+                 rule = 'cuda_compile_sm80'
+@@ -254,6 +266,7 @@ def _write_ninja_file(path,
+         blocks.append(cuda_compile_rule_sm80)  # type: ignore[possibly-undefined]
+         blocks.append(cuda_compile_rule_sm80_sm90)  # type: ignore[possibly-undefined]
+         blocks.append(cuda_compile_rule_sm100)  # type: ignore[possibly-undefined]
++        blocks.append(cuda_compile_rule_community_kv)  # type: ignore[possibly-undefined]
+     blocks += [devlink_rule, link_rule, build, devlink, link, default]
+     content = "\n\n".join("\n".join(b) for b in blocks)
+     # Ninja requires a new lines at the end of the .ninja file
+@@ -384,9 +397,17 @@ exe_extension = sysconfig.get_config_var("EXE")
+ cmdclass = {}
+ ext_modules = []
+ 
+-# We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
+-# files included in the source distribution, in case the user compiles from source.
+-subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
++# We want CUTLASS even if SKIP_CUDA_BUILD because an sdist must include its
++# headers. Restricted runtime images may not ship git, so accept a populated
++# source tree and only require git when the submodule content is absent.
++cutlass_include = Path(this_dir).parent / "csrc" / "cutlass" / "include"
++if not cutlass_include.is_dir():
++    if shutil.which("git") is None:
++        raise RuntimeError("CUTLASS sources are missing and git is not installed")
++    subprocess.run(
++        ["git", "submodule", "update", "--init", "../csrc/cutlass"],
++        check=True,
++    )
+ 
+ if not SKIP_CUDA_BUILD:
+     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
+diff --git a/hopper/softmax.h b/hopper/softmax.h
+index 8fcdb6b..f592032 100644
+--- a/hopper/softmax.h
++++ b/hopper/softmax.h
+@@ -123,6 +123,43 @@ struct Softmax {
+         return scores_scale;
+     };
+ 
++#if defined(COMMUNITY_KV_TOPK_SELECTION)
++    template<bool Is_first, bool Check_inf=false, typename Tensor0>
++    __forceinline__ __device__ TensorT max_get_scale_with_local_max(
++            Tensor0 &acc_s,
++            TensorT &scores_max_local) {
++        Tensor scores = make_tensor(
++            acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
++        static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
++        MaxOp<float> max_op;
++        flash::template thread_reduce_</*zero_init=*/true>(
++            scores, scores_max_local, max_op);
++        Tensor scores_max = make_fragment_like(scores_max_local);
++        cute::copy(scores_max_local, scores_max);
++        flash::quad_allreduce_(scores_max, scores_max, max_op);
++
++        TensorT scores_scale;
++        if constexpr (Is_first) {
++            cute::copy(scores_max, row_max);
++            cute::fill(scores_scale, 1.f);
++        } else {
++            Tensor scores_max_prev = make_fragment_like(row_max);
++            cute::copy(row_max, scores_max_prev);
++            #pragma unroll
++            for (int mi = 0; mi < size(row_max); ++mi) {
++                row_max(mi) = max_op(row_max(mi), scores_max(mi));
++                float scores_max_cur = !Check_inf
++                    ? row_max(mi)
++                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
++                scores_scale(mi) = exp2f(
++                    (scores_max_prev(mi) - scores_max_cur) *
++                    softmax_scale_log2);
++                row_sum(mi) *= scores_scale(mi);
++            }
++        }
++        return scores_scale;
++    };
++#endif
+     template<bool Is_first, bool Check_inf=false, typename Tensor0>
+     __forceinline__ __device__ void online_softmax(Tensor0 &acc_s) {
+         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+diff --git a/hopper/topk_warpselect.h b/hopper/topk_warpselect.h
+new file mode 100644
+index 0000000..a3cbae8
+--- /dev/null
++++ b/hopper/topk_warpselect.h
+@@ -0,0 +1,241 @@
++/******************************************************************************
++ * CommunityKV approximate fixed-point top-8 selection for FlashAttention.
++ *
++ * Each row-mate lane retains six packed candidates. The four sorted lane-local
++ * queues are merged at output without materializing a separate top-8 queue.
++ ******************************************************************************/
++
++#pragma once
++
++#include <cute/tensor.hpp>
++#include <cutlass/numeric_types.h>
++
++namespace flash {
++
++using namespace cute;
++
++template <int kNRows, int K, int B>
++struct WarpSelect;
++
++template <int kNRows>
++struct WarpSelect<kNRows, 8, 16> {
++    static_assert(
++        kNRows == 2,
++        "top-8 selection is specialized for the SM90 d=128 tile");
++
++    static constexpr int K = 8;
++    static constexpr int LocalK = 6;
++    static constexpr int LogicalWarp = 4;
++    static constexpr int IndexBits = 17;
++    static constexpr uint32_t IndexMask =
++        (uint32_t(1) << IndexBits) - 1;
++    static constexpr float ScoreMin = -48.0f;
++    static constexpr float ScoreScale = 256.0f;
++    static constexpr uint32_t Empty = 0;
++
++    uint32_t row0[LocalK];
++    uint32_t row1[LocalK];
++    float scale_log2;
++    float lse0_log2;
++    float lse1_log2;
++
++    template <int R>
++    CUTLASS_DEVICE uint32_t* row() {
++        if constexpr (R == 0) {
++            return row0;
++        } else {
++            return row1;
++        }
++    }
++
++    template <int R>
++    CUTLASS_DEVICE void init_row() {
++        uint32_t* queue = row<R>();
++        #pragma unroll
++        for (int k = 0; k < LocalK; ++k) {
++            queue[k] = Empty;
++        }
++    }
++
++    CUTLASS_DEVICE WarpSelect() {
++        init_row<0>();
++        init_row<1>();
++    }
++
++    CUTLASS_DEVICE static uint16_t score_to_key(float value) {
++        int key = __float2int_rn((value - ScoreMin) * ScoreScale);
++        key = max(0, min(key, 32767));
++        return uint16_t(key);
++    }
++
++    CUTLASS_DEVICE static float key_to_score(uint16_t key) {
++        return float(key) / ScoreScale + ScoreMin;
++    }
++
++    CUTLASS_DEVICE static uint32_t pack(float value, int index) {
++        return (uint32_t(score_to_key(value)) << IndexBits)
++             | (uint32_t(index) & IndexMask);
++    }
++
++    template <int R>
++    CUTLASS_DEVICE void insert(uint32_t candidate) {
++        uint32_t* queue = row<R>();
++        #pragma unroll
++        for (int k = 0; k < LocalK; ++k) {
++            uint32_t const resident = queue[k];
++            queue[k] = max(candidate, resident);
++            candidate = min(candidate, resident);
++        }
++    }
++
++    template <int R, typename ScoresT, typename CoordT>
++    CUTLASS_DEVICE void update_row(
++            ScoresT const& scores,
++            CoordT const& coord,
++            int n_block_offset,
++            int kv_start,
++            float local_max) {
++        constexpr int ncol = decltype(size<1>(scores))::value;
++        uint32_t* queue = row<R>();
++        float const threshold =
++            key_to_score(uint16_t(queue[LocalK - 1] >> IndexBits));
++        bool const skip_local = local_max <= threshold;
++        if (!__all_sync(0xffffffff, skip_local)) {
++            #pragma unroll
++            for (int c = 0; c < ncol; ++c) {
++                float const value = scores(R, c);
++                int const index =
++                    n_block_offset + get<1>(coord(R, c));
++                uint32_t const candidate = pack(value, index);
++                if (index >= kv_start &&
++                    candidate > queue[LocalK - 1]) {
++                    insert<R>(candidate);
++                }
++            }
++        }
++    }
++
++    template <typename ScoresT, typename CoordT, typename TensorMax>
++    CUTLASS_DEVICE void update_with_local_max(
++            ScoresT const& scores,
++            CoordT const& coord,
++            int n_block_offset,
++            int kv_start,
++            TensorMax const& local_max) {
++        update_row<0>(
++            scores, coord, n_block_offset, kv_start, local_max(0));
++        update_row<1>(
++            scores, coord, n_block_offset, kv_start, local_max(1));
++    }
++
++    template <typename TensorLse>
++    CUTLASS_DEVICE void finalize_and_normalize(
++            float softmax_scale_log2,
++            TensorLse const& lse_natural) {
++        scale_log2 = softmax_scale_log2;
++        lse0_log2 = lse_natural(0) * float(M_LOG2E);
++        lse1_log2 = lse_natural(1) * float(M_LOG2E);
++    }
++
++    CUTLASS_DEVICE static unsigned quad_mask() {
++        int const quad = (int(threadIdx.x) & 31) / LogicalWarp;
++        return 0xFu << (quad * LogicalWarp);
++    }
++
++    template <int R, typename CoordT>
++    CUTLASS_DEVICE void write_row(
++            CoordT const& coord_rc,
++            int m_block_row_offset,
++            int bidh,
++            int bidb,
++            int qhead_per_khead,
++            int seqlen_q,
++            int q_skip,
++            float* ptr_val,
++            int32_t* ptr_idx,
++            int64_t stride_batch,
++            int64_t stride_head,
++            int64_t stride_row) {
++        uint32_t const* queue = row<R>();
++        bool const writer = get<1>(coord_rc(R, _0{})) == 0;
++        int const abs_row =
++            m_block_row_offset + get<0>(coord_rc(R, _0{}));
++        int const h_inner =
++            qhead_per_khead == 1 ? 0 : abs_row % qhead_per_khead;
++        int const q_idx =
++            qhead_per_khead == 1 ? abs_row : abs_row / qhead_per_khead;
++        int const abs_h = bidh * qhead_per_khead + h_inner;
++        bool const valid_row = q_idx < seqlen_q && q_idx >= q_skip;
++        int64_t const base = int64_t(bidb) * stride_batch
++                           + int64_t(abs_h) * stride_head
++                           + int64_t(q_idx - q_skip) * stride_row;
++        float const lse_log2 = R == 0 ? lse0_log2 : lse1_log2;
++        unsigned const mask = quad_mask();
++        int const lane = int(threadIdx.x) & (LogicalWarp - 1);
++        uint32_t current = queue[0];
++        int cursor = 0;
++
++        #pragma unroll
++        for (int out = 0; out < K; ++out) {
++            uint32_t best = current;
++            best = max(
++                best,
++                __shfl_xor_sync(mask, best, 1, LogicalWarp));
++            best = max(
++                best,
++                __shfl_xor_sync(mask, best, 2, LogicalWarp));
++            unsigned const winners =
++                __ballot_sync(mask, current == best);
++            int const winner_lane =
++                (__ffs(winners) - 1) & (LogicalWarp - 1);
++
++            if (writer && valid_row) {
++                uint16_t const key = uint16_t(best >> IndexBits);
++                ptr_val[base + out] =
++                    exp2f(key_to_score(key) * scale_log2 - lse_log2);
++                ptr_idx[base + out] = int32_t(best & IndexMask);
++            }
++
++            bool const advance = lane == winner_lane;
++            int const next_cursor = cursor + int(advance);
++            uint32_t next = Empty;
++            #pragma unroll
++            for (int slot = 1; slot < LocalK; ++slot) {
++                next = next_cursor == slot ? queue[slot] : next;
++            }
++            current = advance ? next : current;
++            cursor = next_cursor;
++        }
++    }
++
++    template <typename CoordT>
++    CUTLASS_DEVICE void write_to_gmem(
++            CoordT const& coord_rc,
++            int m_block_row_offset,
++            int bidh,
++            int bidb,
++            int qhead_per_khead,
++            int seqlen_q,
++            int q_skip,
++            float* ptr_val,
++            int32_t* ptr_idx,
++            int64_t stride_batch,
++            int64_t stride_head,
++            int64_t stride_row) {
++        if (ptr_val == nullptr || ptr_idx == nullptr) {
++            return;
++        }
++        write_row<0>(
++            coord_rc, m_block_row_offset, bidh, bidb,
++            qhead_per_khead, seqlen_q, q_skip,
++            ptr_val, ptr_idx,
++            stride_batch, stride_head, stride_row);
++        write_row<1>(
++            coord_rc, m_block_row_offset, bidh, bidb,
++            qhead_per_khead, seqlen_q, q_skip,
++            ptr_val, ptr_idx,
++            stride_batch, stride_head, stride_row);
++    }
++};
++
++}  // namespace flash
